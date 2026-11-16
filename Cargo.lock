@@ -967,6 +967,7 @@ dependencies = [
  "profiling",
  "serde",
  "serde_yaml",
+ "tracing",
  "web-sys",
  "wgpu",
  "winit",

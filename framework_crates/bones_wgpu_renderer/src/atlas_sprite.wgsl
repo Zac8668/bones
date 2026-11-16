@@ -1,31 +1,34 @@
 // Must match the Rust layout
 struct AtlasSpriteUniform {
-    entity_type:  u32,       
-    camera_index: u32,
-    _pad0:        u32,
-    _pad1:        u32,
-    transform:    mat4x4<f32>,
-    color_tint:   vec4<f32>,  
+    entity_type:    u32,
+    camera_index:   u32,
+    _pad0:          u32,
+    _pad1:          u32,
+    transform:      mat4x4<f32>,
+    color_tint:     vec4<f32>,
 
-    flip_x:       u32,        
-    flip_y:       u32,        
-    uv_min:       vec2<f32>,  
-    uv_max:       vec2<f32>,  
+    flip_x:         u32,
+    flip_y:         u32,
+    uv_min:         vec2<f32>,
+    uv_max:         vec2<f32>,
 
-    tile_size:    vec2<f32>,  
-    image_size:   vec2<f32>,  
-    padding:      vec2<f32>,  
-    offset:       vec2<f32>,  
+    tile_size:      vec2<f32>,
+    image_size:     vec2<f32>,
+    padding:        vec2<f32>,
+    offset:         vec2<f32>,
 
-    columns:      u32,        
-    index:        u32,        
+    columns:        u32,
+    index:          u32,
+
+    shader_params0: vec4<f32>,
+    shader_params1: vec4<f32>,
 };
 
 // Camera uniform, one per render pass 
 struct CameraUniform {
     transform: mat4x4<f32>,
     screen_size: vec2<f32>,
-    _pad0: u32,  
+    time: f32,
     _pad1: u32, // Padding to ensure 16-byte alignment
 }
 
@@ -51,6 +54,7 @@ struct VertexOutput {
     @builtin(position) clipPos:    vec4<f32>,
     @location(0)       quad_uv:    vec2<f32>,
     @location(1) @interpolate(flat) inst_index: u32,
+    @location(2)       world_pos:  vec2<f32>,
 };
 
 // Vertex Shader
@@ -87,27 +91,20 @@ fn vs_main(
     if inst.flip_y == 1u { base_uv.y = 1.0 - base_uv.y; }
     out.quad_uv = base_uv;
 
-    // 4) Pass instance index along
+    // 4) Pass instance index and unscaled world pixel coordinate along
     out.inst_index = idx;
+    out.world_pos = (inst.transform * vec4(vert.position.xy * inst.tile_size, 0.0, 1.0)).xy;
     return out;
 }
 
-// Fragment Shader
-@fragment
-fn fs_main(
-    in: VertexOutput
-) -> @location(0) vec4<f32> {
-    let inst = sprite_data[in.inst_index];
-
-    var uv: vec2<f32>;
-
+fn resolve_atlas_uv(inst: AtlasSpriteUniform, quad_uv_in: vec2<f32>) -> vec2<f32> {
     // If this is a tiled sheet sprite, compute the sub‐cell directly from [0, 1] `quad_uv`
     if inst.entity_type == 1u {
         // Inset slightly inside [0, 1] (never more than 0.25 texels) so sampling at the 1.0
         // boundary does not bleed into the adjacent tile in an unpadded spritesheet.
         let safe_tile_size = max(inst.tile_size, vec2<f32>(1.0, 1.0));
         let eps = min(vec2<f32>(1e-4, 1e-4), vec2<f32>(0.25, 0.25) / safe_tile_size);
-        let quad_uv = clamp(in.quad_uv, eps, vec2<f32>(1.0, 1.0) - eps);
+        let quad_uv = clamp(quad_uv_in, eps, vec2<f32>(1.0, 1.0) - eps);
 
         // Normalize dimensions by image size
         let safe_image_size = max(inst.image_size, vec2<f32>(1.0, 1.0));
@@ -133,15 +130,11 @@ fn fs_main(
         //    indices never bleed into unrelated sprites packed in the same AtlasPool texture.
         let tile_uv = clamp(mix(tile_min, tile_max, quad_uv), vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
         // 2) Tile UV -> atlas-pool UV (inside the packed atlas pool rect)
-        uv = mix(inst.uv_min, inst.uv_max, tile_uv);
+        return mix(inst.uv_min, inst.uv_max, tile_uv);
     } else {
-        let clamped_uv = clamp(in.quad_uv, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
-        uv = mix(inst.uv_min, inst.uv_max, clamped_uv);
+        let clamped_uv = clamp(quad_uv_in, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
+        return mix(inst.uv_min, inst.uv_max, clamped_uv);
     }
-
-    // Sample the atlas at the correct UV and apply tint
-    let tex_col = textureSample(diffuseTex, texSampler, uv);
-    return tex_col * inst.color_tint;
 }
 
 fn scale_translation(matrix: mat4x4<f32>, translation_scale: vec3<f32>) -> mat4x4<f32> {
@@ -151,4 +144,18 @@ fn scale_translation(matrix: mat4x4<f32>, translation_scale: vec3<f32>) -> mat4x
         matrix[2],
         vec4<f32>(matrix[3].xyz * translation_scale, matrix[3].w)
     );
+}
+
+// @default_fragment
+// Fragment Shader
+@fragment
+fn fs_main(
+    in: VertexOutput
+) -> @location(0) vec4<f32> {
+    let inst = sprite_data[in.inst_index];
+    let uv = resolve_atlas_uv(inst, in.quad_uv);
+
+    // Sample the atlas at the correct UV and apply tint
+    let tex_col = textureSample(diffuseTex, texSampler, uv);
+    return tex_col * inst.color_tint;
 }

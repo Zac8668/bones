@@ -5,7 +5,8 @@ use convert::IntoBones;
 use image::RgbaImage;
 use pollster::FutureExt;
 use std::{
-    collections::{HashSet, VecDeque},
+    borrow::Cow,
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -269,60 +270,9 @@ impl BonesWgpuRenderer {
         }
         .block_on();
 
-        // Texture bind group layout (matches @group(0) in WGSL)
-        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    // This should match the filterable field of the textures
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-            label: Some("texture_bind_group_layout"),
-        });
-
-        // Storage buffer bind group layout (matches @group(1) in WGSL)
-        let storage_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("storage_bind_group_layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-
+        let (texture_layout, storage_layout, camera_layout) = create_bind_group_layouts(&device);
         let camera_entry_size =
             std::num::NonZeroU64::new(std::mem::size_of::<CameraTransform>() as u64);
-        let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("camera_bind_group_layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: true,
-                    min_binding_size: camera_entry_size,
-                },
-                count: None,
-            }],
-        });
 
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Index Buffer"),
@@ -438,13 +388,8 @@ impl BonesWgpuRenderer {
             present_mode: self.present_mode,
         };
 
-        let atlas_pool = atlas_pool::AtlasPool::new(
-            &device,
-            &texture_layout,
-            (4096, 4096),
-            64,
-            self.pixel_art,
-        );
+        let atlas_pool =
+            atlas_pool::AtlasPool::new(&device, &texture_layout, (4096, 4096), 64, self.pixel_art);
 
         let mut app = App(Some(AppState {
             state: None,
@@ -862,6 +807,8 @@ impl AppState {
                 );
                 state.sprite_render_pipeline = sprite_pipeline;
                 state.line_render_pipeline = line_pipeline;
+                state.custom_sprite_pipelines.clear();
+                state.attempted_shaders.clear();
                 state.egui_renderer =
                     EguiRenderer::new(&self.device, view_format, None, 1, &window);
                 state.egui_fonts_loaded = false;
@@ -1191,11 +1138,151 @@ impl AppState {
     }
 }
 
+fn create_bind_group_layouts(
+    device: &wgpu::Device,
+) -> (
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+) {
+    // Texture bind group layout (matches @group(0) in WGSL)
+    let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                // This should match the filterable field of the textures
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+        label: Some("texture_bind_group_layout"),
+    });
+
+    // Storage buffer bind group layout (matches @group(1) in WGSL)
+    let storage_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("storage_bind_group_layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+
+    let camera_entry_size =
+        std::num::NonZeroU64::new(std::mem::size_of::<CameraTransform>() as u64);
+    let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("camera_bind_group_layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: true,
+                min_binding_size: camera_entry_size,
+            },
+            count: None,
+        }],
+    });
+
+    (texture_layout, storage_layout, camera_layout)
+}
+
+const DEFAULT_SPRITE_WGSL: &str = include_str!("atlas_sprite.wgsl");
+
+fn is_standalone_sprite_wgsl(source: &str) -> bool {
+    source.lines().any(|line| {
+        let trimmed = line.split("//").next().unwrap_or("").trim();
+        trimmed.starts_with("@vertex") || trimmed.starts_with("fn vs_main")
+    })
+}
+
+fn build_custom_sprite_wgsl(wgsl_source: &str) -> Cow<'_, str> {
+    if is_standalone_sprite_wgsl(wgsl_source) {
+        Cow::Borrowed(wgsl_source)
+    } else {
+        let (prelude, _) = DEFAULT_SPRITE_WGSL
+            .split_once("// @default_fragment")
+            .expect("missing @default_fragment marker in atlas_sprite.wgsl");
+        Cow::Owned(format!("{prelude}\n{wgsl_source}"))
+    }
+}
+
+fn key_event_triggered(game: &bones::Game, key: bones::KeyCode, pressed: bool) -> bool {
+    game.get_shared_resource::<bones::KeyboardInputs>()
+        .is_some_and(|k| {
+            k.key_events
+                .iter()
+                .any(|e| e.key_code.option() == Some(key) && e.button_state.pressed() == pressed)
+        })
+}
+
+fn reload_custom_shaders_from_disk(
+    game: &bones::Game,
+    custom_sprite_pipelines: &mut HashMap<bones::Handle<bones::Shader>, wgpu::RenderPipeline>,
+    attempted_shaders: &mut HashSet<bones::Handle<bones::Shader>>,
+    mut compile_fn: impl FnMut(&str, &str) -> Option<wgpu::RenderPipeline>,
+) {
+    let shader_paths: Vec<(bones::Handle<bones::Shader>, PathBuf)> = {
+        let Some(asset_server) = game.get_shared_resource::<bones::AssetServer>() else {
+            return;
+        };
+        asset_server
+            .store
+            .asset_ids
+            .iter()
+            .filter_map(|entry| {
+                let handle = (*entry.key()).typed::<bones::Shader>();
+                let cid = *entry.value();
+                let asset = asset_server.store.assets.get(&cid)?;
+                let shader = asset.data.try_cast_ref::<bones::Shader>().ok()?;
+                let path = shader.path.clone()?;
+                Some((handle, path))
+            })
+            .collect()
+    };
+
+    for (handle, path) in shader_paths {
+        let label = path.display().to_string();
+        let wgsl_source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(err) => {
+                tracing::warn!("Failed to read shader {:?} (F5): {err}", path);
+                continue;
+            }
+        };
+
+        attempted_shaders.insert(handle);
+        if let Some(new_pipeline) = compile_fn(&label, &wgsl_source) {
+            custom_sprite_pipelines.insert(handle, new_pipeline);
+            tracing::info!("Reloaded shader {:?} (F5)", path);
+        }
+    }
+}
+
 struct State {
     egui_renderer: EguiRenderer,
     sprite_render_pipeline: wgpu::RenderPipeline,
+    custom_sprite_pipelines: HashMap<bones::Handle<bones::Shader>, wgpu::RenderPipeline>,
+    attempted_shaders: HashSet<bones::Handle<bones::Shader>>,
     line_render_pipeline: wgpu::RenderPipeline,
     line_buffers: line::LineBuffers,
+    texture_layout: Arc<wgpu::BindGroupLayout>,
     dynamic_storage: DynamicBuffer,
     camera_dynamic_uniform: DynamicBuffer,
     vertex_buffer: Arc<wgpu::Buffer>,
@@ -1211,12 +1298,125 @@ struct State {
     /// When preloading assets, we pause all sessions to avoid running user startup systems before
     /// assets exist (which would create default handles with no CID and panic on access).
     saved_session_states: Option<Vec<(bones::Ustr, bool, bool)>>,
+    start_time: bones::Instant,
     queue: Arc<wgpu::Queue>,
     device: Arc<wgpu::Device>,
     window: Arc<Window>,
 }
 
 impl State {
+    fn create_sprite_pipeline_with_module(
+        device: &wgpu::Device,
+        texture_layout: &wgpu::BindGroupLayout,
+        storage_layout: &wgpu::BindGroupLayout,
+        camera_layout: &wgpu::BindGroupLayout,
+        view_format: wgpu::TextureFormat,
+        shader: &wgpu::ShaderModule,
+        label: Option<&str>,
+    ) -> wgpu::RenderPipeline {
+        let render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout"),
+                bind_group_layouts: &[texture_layout, storage_layout, camera_layout],
+                push_constant_ranges: &[],
+            });
+
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label,
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Vertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: view_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                // Requires Features::DEPTH_CLIP_CONTROL
+                unclipped_depth: false,
+                // Requires Features::CONSERVATIVE_RASTERIZATION
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        })
+    }
+
+    fn compile_custom_sprite_pipeline(
+        device: &wgpu::Device,
+        texture_layout: &wgpu::BindGroupLayout,
+        storage_layout: &wgpu::BindGroupLayout,
+        camera_layout: &wgpu::BindGroupLayout,
+        view_format: wgpu::TextureFormat,
+        label: &str,
+        wgsl_source: &str,
+    ) -> Option<wgpu::RenderPipeline> {
+        let source = build_custom_sprite_wgsl(wgsl_source);
+
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(source),
+        });
+        if let Some(err) = pollster::block_on(device.pop_error_scope()) {
+            tracing::warn!("Shader compilation failed for {label}: {err}");
+            return None;
+        }
+
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let pipeline = Self::create_sprite_pipeline_with_module(
+            device,
+            texture_layout,
+            storage_layout,
+            camera_layout,
+            view_format,
+            &shader,
+            Some(label),
+        );
+        if let Some(err) = pollster::block_on(device.pop_error_scope()) {
+            tracing::warn!("Shader compilation failed for {label}: {err}");
+            return None;
+        }
+
+        Some(pipeline)
+    }
+
+    fn try_compile_custom_sprite_pipeline(
+        &self,
+        label: &str,
+        wgsl_source: &str,
+    ) -> Option<wgpu::RenderPipeline> {
+        Self::compile_custom_sprite_pipeline(
+            &self.device,
+            &self.texture_layout,
+            &self.dynamic_storage.layout,
+            &self.camera_dynamic_uniform.layout,
+            self.surface_format.add_srgb_suffix(),
+            label,
+            wgsl_source,
+        )
+    }
+
     fn create_pipelines(
         device: &wgpu::Device,
         texture_layout: &wgpu::BindGroupLayout,
@@ -1226,56 +1426,18 @@ impl State {
     ) -> (wgpu::RenderPipeline, wgpu::RenderPipeline) {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("atlas_sprite.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(DEFAULT_SPRITE_WGSL.into()),
         });
 
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[texture_layout, storage_layout, camera_layout],
-                push_constant_ranges: &[],
-            });
-
-        let sprite_render_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Sprite Render Pipeline"),
-                layout: Some(&render_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[Vertex::desc()],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: view_format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    // Requires Features::DEPTH_CLIP_CONTROL
-                    unclipped_depth: false,
-                    // Requires Features::CONSERVATIVE_RASTERIZATION
-                    conservative: false,
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview: None,
-                cache: None,
-            });
+        let sprite_render_pipeline = Self::create_sprite_pipeline_with_module(
+            device,
+            texture_layout,
+            storage_layout,
+            camera_layout,
+            view_format,
+            &shader,
+            Some("Sprite Render Pipeline"),
+        );
 
         let line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Line Shader"),
@@ -1369,8 +1531,11 @@ impl State {
         let state = State {
             egui_renderer,
             sprite_render_pipeline,
+            custom_sprite_pipelines: HashMap::new(),
+            attempted_shaders: HashSet::new(),
             line_render_pipeline,
             line_buffers,
+            texture_layout,
             dynamic_storage,
             camera_dynamic_uniform,
             vertex_buffer,
@@ -1384,6 +1549,7 @@ impl State {
             egui_fonts_loaded: false,
             preload_assets,
             saved_session_states: None,
+            start_time: bones::Instant::now(),
             queue,
             device,
             window,
@@ -1493,6 +1659,79 @@ impl State {
                 None
             }
         }
+    }
+
+    fn ensure_custom_shaders_compiled(
+        &mut self,
+        game: &bones::Game,
+        prepared_sessions: &[PreparedSessionRender],
+    ) {
+        let mut to_compile: Vec<(bones::Handle<bones::Shader>, String, String)> = Vec::new();
+        let mut seen: HashSet<bones::Handle<bones::Shader>> = HashSet::new();
+
+        {
+            let Some(asset_server) = game.get_shared_resource::<bones::AssetServer>() else {
+                return;
+            };
+
+            for prepared in prepared_sessions {
+                for draw_cmd in &prepared.draws {
+                    let SessionDrawCmd::SpriteBatch {
+                        shader: Some(handle),
+                        ..
+                    } = draw_cmd
+                    else {
+                        continue;
+                    };
+                    if self.custom_sprite_pipelines.contains_key(handle)
+                        || self.attempted_shaders.contains(handle)
+                        || !seen.insert(*handle)
+                    {
+                        continue;
+                    }
+                    let Some(Ok(shader)) = asset_server.try_get(*handle) else {
+                        continue;
+                    };
+                    let label = shader
+                        .path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| format!("{handle:?}"));
+                    to_compile.push((*handle, label, shader.source.clone()));
+                }
+            }
+        }
+
+        for (handle, label, source) in to_compile {
+            self.attempted_shaders.insert(handle);
+            if let Some(pipeline) = self.try_compile_custom_sprite_pipeline(&label, &source) {
+                self.custom_sprite_pipelines.insert(handle, pipeline);
+            }
+        }
+    }
+
+    fn reload_shaders_from_disk(&mut self, game: &bones::Game) {
+        let device = &self.device;
+        let texture_layout = &self.texture_layout;
+        let storage_layout = &self.dynamic_storage.layout;
+        let camera_layout = &self.camera_dynamic_uniform.layout;
+        let view_format = self.surface_format.add_srgb_suffix();
+        reload_custom_shaders_from_disk(
+            game,
+            &mut self.custom_sprite_pipelines,
+            &mut self.attempted_shaders,
+            |label, source| {
+                Self::compile_custom_sprite_pipeline(
+                    device,
+                    texture_layout,
+                    storage_layout,
+                    camera_layout,
+                    view_format,
+                    label,
+                    source,
+                )
+            },
+        );
     }
 
     fn render(&mut self, game: &mut bones::Game, atlas_pool: &mut atlas_pool::AtlasPool) {
@@ -1642,6 +1881,7 @@ impl State {
         let scale_factor = (self.window.scale_factor() as f32).max(f32::EPSILON);
         let target_size = UVec2::new(self.size.width, self.size.height);
 
+        let elapsed_time = self.start_time.elapsed().as_secs_f32();
         update_atlas_pool(game, atlas_pool, &self.queue);
         let prepared_sessions = prepare_render_frame(
             game,
@@ -1654,7 +1894,14 @@ impl State {
             target_size,
             scale_factor,
             frame_clear_bones_color,
+            elapsed_time,
         );
+
+        // Manual F5 shader hot-reload (mirrors F4 hotkey handling below).
+        if key_event_triggered(game, bones::KeyCode::F5, true) {
+            self.reload_shaders_from_disk(game);
+        }
+        self.ensure_custom_shaders_compiled(game, &prepared_sessions);
 
         // Acquire swapchain texture view.
         let Some(surface_texture) = self.acquire_surface_texture() else {
@@ -1694,7 +1941,7 @@ impl State {
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum ActivePipeline {
             None,
-            Sprite,
+            Sprite(Option<bones::Handle<bones::Shader>>),
             Line,
         }
 
@@ -1768,25 +2015,41 @@ impl State {
                     match draw_cmd {
                         SessionDrawCmd::SpriteBatch {
                             atlas_id,
+                            shader,
                             instances,
                         } => {
                             let Some(atlas) = atlas_pool.atlases.get(*atlas_id) else {
                                 continue;
                             };
-                            if active_pipeline != ActivePipeline::Sprite {
-                                pass.set_pipeline(&self.sprite_render_pipeline);
-                                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                                pass.set_index_buffer(
-                                    self.index_buffer.slice(..),
-                                    wgpu::IndexFormat::Uint16,
-                                );
-                                pass.set_bind_group(1, self.dynamic_storage.get_bind_group(), &[]);
-                                pass.set_bind_group(
-                                    2,
-                                    self.camera_dynamic_uniform.get_bind_group(),
-                                    &[cam_draw.uniform_offset],
-                                );
-                                active_pipeline = ActivePipeline::Sprite;
+                            let (resolved_key, pipeline) = match shader
+                                .as_ref()
+                                .and_then(|h| self.custom_sprite_pipelines.get(h).map(|p| (*h, p)))
+                            {
+                                Some((h, p)) => (ActivePipeline::Sprite(Some(h)), p),
+                                None => {
+                                    (ActivePipeline::Sprite(None), &self.sprite_render_pipeline)
+                                }
+                            };
+                            if active_pipeline != resolved_key {
+                                pass.set_pipeline(pipeline);
+                                if !matches!(active_pipeline, ActivePipeline::Sprite(_)) {
+                                    pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                                    pass.set_index_buffer(
+                                        self.index_buffer.slice(..),
+                                        wgpu::IndexFormat::Uint16,
+                                    );
+                                    pass.set_bind_group(
+                                        1,
+                                        self.dynamic_storage.get_bind_group(),
+                                        &[],
+                                    );
+                                    pass.set_bind_group(
+                                        2,
+                                        self.camera_dynamic_uniform.get_bind_group(),
+                                        &[cam_draw.uniform_offset],
+                                    );
+                                }
+                                active_pipeline = resolved_key;
                             }
                             pass.set_bind_group(0, &atlas.bind_group, &[]);
                             pass.draw_indexed(0..6, 0, instances.clone());
@@ -1826,13 +2089,7 @@ impl State {
             // F4 debug overlay to show atlas pool
             static DEBUG_ATLAS_IDX: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
             let mut debug_idx = DEBUG_ATLAS_IDX.lock().unwrap();
-            let f4_pressed = game
-                .get_shared_resource::<bones::KeyboardInputs>()
-                .is_some_and(|k| {
-                    k.key_events.iter().any(|e| {
-                        e.key_code.option() == Some(bones::KeyCode::F4) && !e.button_state.pressed()
-                    })
-                });
+            let f4_pressed = key_event_triggered(game, bones::KeyCode::F4, false);
             if f4_pressed {
                 let n = atlas_pool.atlases.len();
                 *debug_idx = match *debug_idx {
@@ -2133,55 +2390,7 @@ mod tests {
             return;
         };
 
-        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-            label: Some("test_texture_layout"),
-        });
-        let storage_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("test_storage_layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let camera_entry_size =
-            std::num::NonZeroU64::new(std::mem::size_of::<CameraTransform>() as u64);
-        let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("test_camera_layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: true,
-                    min_binding_size: camera_entry_size,
-                },
-                count: None,
-            }],
-        });
+        let (texture_layout, storage_layout, camera_layout) = create_bind_group_layouts(&device);
 
         let _pipelines = State::create_pipelines(
             &device,
@@ -2190,5 +2399,120 @@ mod tests {
             &camera_layout,
             wgpu::TextureFormat::Bgra8UnormSrgb,
         );
+    }
+
+    #[test]
+    fn custom_sprite_pipeline_compilation_and_f5_last_working_fallback() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let Some(adapter) = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .block_on()
+        else {
+            return;
+        };
+        let required_limits = wgpu::Limits::default().using_resolution(adapter.limits());
+        let Ok((device, _queue)) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    required_limits,
+                    ..Default::default()
+                },
+                None,
+            )
+            .block_on()
+        else {
+            return;
+        };
+
+        let (texture_layout, storage_layout, camera_layout) = create_bind_group_layouts(&device);
+
+        let view_format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let compile = |label: &str, src: &str| {
+            State::compile_custom_sprite_pipeline(
+                &device,
+                &texture_layout,
+                &storage_layout,
+                &camera_layout,
+                view_format,
+                label,
+                src,
+            )
+        };
+
+        let valid_fragment_wgsl = r#"
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let inst = sprite_data[in.inst_index];
+    let uv = resolve_atlas_uv(inst, in.quad_uv);
+    let tex_col = textureSample(diffuseTex, texSampler, uv);
+    let wave = 0.5 + 0.5 * sin(camera.time + in.world_pos.x * 0.05);
+    return vec4<f32>(tex_col.rgb * inst.shader_params0.rgb * wave + inst.shader_params1.rgb * 0.0, tex_col.a);
+}
+"#;
+        assert!(compile("fragment_only.wgsl", valid_fragment_wgsl).is_some());
+        assert!(compile("standalone.wgsl", DEFAULT_SPRITE_WGSL).is_some());
+        assert!(compile("broken.wgsl", "this is not valid wgsl @@@").is_none());
+        assert!(compile("missing_entry.wgsl", "fn helper() -> f32 { return 1.0; }").is_none());
+
+        // Verify F5 disk reload with last-working-shader fallback.
+        let temp_dir = std::env::temp_dir().join(format!(
+            "bones_wgpu_shader_reload_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let shader_path = temp_dir.join("water.wgsl");
+        std::fs::write(&shader_path, valid_fragment_wgsl).unwrap();
+
+        let mut game = bones::Game::new();
+        let assets = game.init_shared_resource::<bones::AssetServer>();
+        let handle = bones::UntypedHandle {
+            rid: bones::Ulid(42),
+        }
+        .typed();
+        let cid = bones::Cid([7; 32]);
+        assets.store.asset_ids.insert(handle.untyped(), cid);
+        assets.store.assets.insert(
+            cid,
+            bones::LoadedAsset {
+                cid,
+                pack_spec: None,
+                loc: bones::AssetLoc {
+                    path: PathBuf::from("/shaders/water.wgsl"),
+                    pack: None,
+                },
+                dependencies: Vec::new(),
+                data: bones::SchemaBox::new(bones::Shader {
+                    source: valid_fragment_wgsl.to_string(),
+                    path: Some(shader_path.clone()),
+                }),
+            },
+        );
+        drop(assets);
+
+        let mut pipelines: HashMap<bones::Handle<bones::Shader>, wgpu::RenderPipeline> =
+            HashMap::new();
+        let mut attempted: HashSet<bones::Handle<bones::Shader>> = HashSet::new();
+
+        // 1. Valid initial F5 reload caches pipeline.
+        reload_custom_shaders_from_disk(&game, &mut pipelines, &mut attempted, compile);
+        assert!(pipelines.contains_key(&handle));
+        assert!(attempted.contains(&handle));
+
+        // 2. Break the file on disk and press F5: existing working pipeline MUST remain cached!
+        std::fs::write(&shader_path, "invalid wgsl syntax !!!").unwrap();
+        reload_custom_shaders_from_disk(&game, &mut pipelines, &mut attempted, compile);
+        assert!(pipelines.contains_key(&handle));
+
+        // 3. Delete the file on disk and press F5: read error MUST keep existing working pipeline!
+        std::fs::remove_file(&shader_path).unwrap();
+        reload_custom_shaders_from_disk(&game, &mut pipelines, &mut attempted, compile);
+        assert!(pipelines.contains_key(&handle));
+
+        // 4. Restore valid file on disk and press F5: recompiles cleanly.
+        std::fs::write(&shader_path, valid_fragment_wgsl).unwrap();
+        reload_custom_shaders_from_disk(&game, &mut pipelines, &mut attempted, compile);
+        assert!(pipelines.contains_key(&handle));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

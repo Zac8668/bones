@@ -1,30 +1,33 @@
 // Must match AtlasSpriteUniform in sprite.rs
 struct AtlasSpriteUniform {
-    entity_type:  u32,
-    camera_index: u32,
-    _pad0:        u32,
-    _pad1:        u32,
-    transform:    mat4x4<f32>,
-    color_tint:   vec4<f32>,
+    entity_type:    u32,
+    camera_index:   u32,
+    _pad0:          u32,
+    _pad1:          u32,
+    transform:      mat4x4<f32>,
+    color_tint:     vec4<f32>,
 
-    flip_x:       u32,
-    flip_y:       u32,
-    uv_min:       vec2<f32>,
-    uv_max:       vec2<f32>,
+    flip_x:         u32,
+    flip_y:         u32,
+    uv_min:         vec2<f32>,
+    uv_max:         vec2<f32>,
 
-    tile_size:    vec2<f32>,
-    image_size:   vec2<f32>,
-    padding:      vec2<f32>,
-    offset:       vec2<f32>,
+    tile_size:      vec2<f32>,
+    image_size:     vec2<f32>,
+    padding:        vec2<f32>,
+    offset:         vec2<f32>,
 
-    columns:      u32,
-    index:        u32,
+    columns:        u32,
+    index:          u32,
+
+    shader_params0: vec4<f32>,
+    shader_params1: vec4<f32>,
 };
 
 struct CameraUniform {
     transform: mat4x4<f32>,
     screen_size: vec2<f32>,
-    _pad0: u32,
+    time: f32,
     _pad1: u32,
 }
 

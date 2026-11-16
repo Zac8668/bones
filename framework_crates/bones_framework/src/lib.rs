@@ -123,6 +123,7 @@ impl AssetServerExt for &mut bones_asset::AssetServer {
         // Register asset schemas
         Image::register_schema();
         Atlas::register_schema();
+        Shader::register_schema();
 
         #[cfg(feature = "localization")]
         {

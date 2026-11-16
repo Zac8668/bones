@@ -13,7 +13,7 @@ use std::{collections::HashSet, ops::Range};
 pub struct CameraTransform {
     pub transform: [[f32; 4]; 4],
     pub screen_size: [f32; 2],
-    pub _pad0: u32,
+    pub time: f32,
     pub _pad1: u32,
     pub _align_pad: [[u32; 4]; 11],
 }
@@ -43,9 +43,20 @@ pub struct AtlasSpriteUniform {
 
     pub columns: u32,
     pub index: u32,
+
+    // Custom shader parameters
+    pub shader_params0: [f32; 4],
+    pub shader_params1: [f32; 4],
 }
 
 impl AtlasSpriteUniform {
+    pub fn with_material(mut self, material: Option<&bones::SpriteMaterial>) -> Self {
+        if let Some(material) = material {
+            self.shader_params0 = material.params0.to_array();
+            self.shader_params1 = material.params1.to_array();
+        }
+        self
+    }
     pub fn from_atlas_sprite(
         atlas_sprite: &bones::AtlasSprite,
         atlas: &bones::Atlas,
@@ -519,6 +530,7 @@ pub struct ResolvedCameraDraw {
 pub enum SessionDrawCmd {
     SpriteBatch {
         atlas_id: usize,
+        shader: Option<bones::Handle<bones::Shader>>,
         instances: Range<u32>,
     },
     Line(line::LineDrawCall),
@@ -543,7 +555,16 @@ struct SortableRenderItem {
     z: f32,
     kind_order: u8,
     atlas_id: usize,
+    shader: Option<bones::Handle<bones::Shader>>,
     payload: RenderItemPayload,
+}
+
+fn resolve_material_shader(
+    material: Option<&bones::SpriteMaterial>,
+) -> Option<bones::Handle<bones::Shader>> {
+    material
+        .map(|m| m.shader)
+        .filter(|h| *h != bones::Handle::default())
 }
 
 fn lookup_cached_image<'a>(
@@ -570,6 +591,7 @@ pub fn prepare_render_frame(
     target_size: UVec2,
     scale_factor: f32,
     frame_clear_color: bones::Color,
+    elapsed_time: f32,
 ) -> Vec<PreparedSessionRender> {
     // NOTE: This must match `pixel_scale` in `atlas_sprite.wgsl` and `line.wgsl`.
     // It is used to keep world-space values (in pixels) numerically small on the GPU.
@@ -652,6 +674,7 @@ pub fn prepare_render_frame(
             camera_transforms.push(CameraTransform {
                 transform: camera_to_clip.to_cols_array_2d(),
                 screen_size: vp.size.into(),
+                time: elapsed_time,
                 ..Default::default()
             });
 
@@ -737,29 +760,35 @@ pub fn prepare_render_frame(
         let tile_layers = session.world.component::<bones::TileLayer>();
         let tiles = session.world.component::<bones::Tile>();
         let paths = session.world.component::<bones::Path2d>();
+        let materials = session.world.component::<bones::SpriteMaterial>();
 
         let mut render_items: Vec<SortableRenderItem> = Vec::new();
 
         if let Some(ref assets) = assets {
-            for (_ent, (sprite, transform)) in entities.iter_with((&sprites, &transforms)) {
+            for (ent, (sprite, transform)) in entities.iter_with((&sprites, &transforms)) {
                 let Some(cached) = lookup_cached_image(assets, atlas_pool, sprite.image) else {
                     continue;
                 };
                 let image_size = Vec2::new(cached.image_size[0], cached.image_size[1]);
+                let material = materials.get(ent);
                 render_items.push(SortableRenderItem {
                     z: transform.translation.z,
                     kind_order: 0,
                     atlas_id: cached.atlas_id,
-                    payload: RenderItemPayload::Sprite(AtlasSpriteUniform::from_sprite(
-                        sprite,
-                        transform,
-                        (cached.uv_min, cached.uv_max),
-                        image_size,
-                    )),
+                    shader: resolve_material_shader(material),
+                    payload: RenderItemPayload::Sprite(
+                        AtlasSpriteUniform::from_sprite(
+                            sprite,
+                            transform,
+                            (cached.uv_min, cached.uv_max),
+                            image_size,
+                        )
+                        .with_material(material),
+                    ),
                 });
             }
 
-            for (_ent, (atlas_sprite, transform)) in entities.iter_with((&atlases, &transforms)) {
+            for (ent, (atlas_sprite, transform)) in entities.iter_with((&atlases, &transforms)) {
                 if atlas_sprite.atlas == bones::Handle::default() {
                     continue;
                 }
@@ -770,21 +799,28 @@ pub fn prepare_render_frame(
                     continue;
                 };
                 let image_size = Vec2::new(cached.image_size[0], cached.image_size[1]);
+                let material = materials.get(ent);
                 render_items.push(SortableRenderItem {
                     z: transform.translation.z,
                     kind_order: 0,
                     atlas_id: cached.atlas_id,
-                    payload: RenderItemPayload::Sprite(AtlasSpriteUniform::from_atlas_sprite(
-                        atlas_sprite,
-                        &atlas,
-                        transform,
-                        (cached.uv_min, cached.uv_max),
-                        image_size,
-                    )),
+                    shader: resolve_material_shader(material),
+                    payload: RenderItemPayload::Sprite(
+                        AtlasSpriteUniform::from_atlas_sprite(
+                            atlas_sprite,
+                            &atlas,
+                            transform,
+                            (cached.uv_min, cached.uv_max),
+                            image_size,
+                        )
+                        .with_material(material),
+                    ),
                 });
             }
 
-            for (_ent, (tile_layer, transform)) in entities.iter_with((&tile_layers, &transforms)) {
+            for (layer_ent, (tile_layer, transform)) in
+                entities.iter_with((&tile_layers, &transforms))
+            {
                 if tile_layer.grid_size.x == 0
                     || tile_layer.grid_size.y == 0
                     || tile_layer.atlas == bones::Handle::default()
@@ -798,6 +834,7 @@ pub fn prepare_render_frame(
                     continue;
                 };
                 let image_size = Vec2::new(cached.image_size[0], cached.image_size[1]);
+                let layer_material = materials.get(layer_ent);
                 let max_slots = (tile_layer.grid_size.x as usize)
                     .saturating_mul(tile_layer.grid_size.y as usize);
 
@@ -808,19 +845,24 @@ pub fn prepare_render_frame(
                     let Some(tile) = tiles.get(*tile_ent) else {
                         continue;
                     };
+                    let material = materials.get(*tile_ent).or(layer_material);
                     render_items.push(SortableRenderItem {
                         z: transform.translation.z,
                         kind_order: 0,
                         atlas_id: cached.atlas_id,
-                        payload: RenderItemPayload::Sprite(AtlasSpriteUniform::from_tile(
-                            tile,
-                            &atlas,
-                            transform,
-                            (cached.uv_min, cached.uv_max),
-                            image_size,
-                            slot_idx,
-                            tile_layer,
-                        )),
+                        shader: resolve_material_shader(material),
+                        payload: RenderItemPayload::Sprite(
+                            AtlasSpriteUniform::from_tile(
+                                tile,
+                                &atlas,
+                                transform,
+                                (cached.uv_min, cached.uv_max),
+                                image_size,
+                                slot_idx,
+                                tile_layer,
+                            )
+                            .with_material(material),
+                        ),
                     });
                 }
             }
@@ -840,6 +882,7 @@ pub fn prepare_render_frame(
                 z: line_transform.translation.z,
                 kind_order: 1,
                 atlas_id: 0,
+                shader: None,
                 payload: RenderItemPayload::Line {
                     uniform: AtlasSpriteUniform {
                         entity_type: 2,
@@ -853,12 +896,13 @@ pub fn prepare_render_frame(
             });
         }
 
-        // Stable sort back-to-front (ascending Z), grouping same-Z sprites by `atlas_id` for
-        // instanced batching while interleaving `Path2d` lines at their true Z depth.
+        // Stable sort back-to-front (ascending Z), grouping same-Z sprites by `(atlas_id, shader)`
+        // for instanced batching while interleaving `Path2d` lines at their true Z depth.
         render_items.sort_by(|a, b| {
             a.z.total_cmp(&b.z)
                 .then_with(|| a.kind_order.cmp(&b.kind_order))
                 .then_with(|| a.atlas_id.cmp(&b.atlas_id))
+                .then_with(|| a.shader.map(|h| h.id).cmp(&b.shader.map(|h| h.id)))
         });
 
         let mut draws: Vec<SessionDrawCmd> = Vec::new();
@@ -869,16 +913,21 @@ pub fn prepare_render_frame(
                     instances.push(uniform);
                     if let Some(SessionDrawCmd::SpriteBatch {
                         atlas_id,
+                        shader,
                         instances: range,
                     }) = draws.last_mut()
                     {
-                        if *atlas_id == item.atlas_id && range.end == instance_idx {
+                        if *atlas_id == item.atlas_id
+                            && *shader == item.shader
+                            && range.end == instance_idx
+                        {
                             range.end = instance_idx + 1;
                             continue;
                         }
                     }
                     draws.push(SessionDrawCmd::SpriteBatch {
                         atlas_id: item.atlas_id,
+                        shader: item.shader,
                         instances: instance_idx..instance_idx + 1,
                     });
                 }
@@ -1006,5 +1055,206 @@ mod tests {
             &layer,
         );
         assert_eq!(uniform.entity_type, 1);
+    }
+
+    #[test]
+    fn uniform_layouts_match_wgsl_alignment_and_offsets() {
+        assert_eq!(std::mem::align_of::<AtlasSpriteUniform>(), 16);
+        assert_eq!(std::mem::size_of::<AtlasSpriteUniform>(), 192);
+        assert_eq!(
+            std::mem::offset_of!(AtlasSpriteUniform, shader_params0),
+            160
+        );
+        assert_eq!(
+            std::mem::offset_of!(AtlasSpriteUniform, shader_params1),
+            176
+        );
+
+        assert_eq!(std::mem::size_of::<CameraTransform>(), 256);
+        assert_eq!(std::mem::offset_of!(CameraTransform, time), 72);
+    }
+
+    #[test]
+    fn prepare_render_frame_batches_by_atlas_and_shader_and_passes_material_params() {
+        use pollster::FutureExt;
+
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let Some(adapter) = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .block_on()
+        else {
+            return;
+        };
+        let required_limits = wgpu::Limits::default().using_resolution(adapter.limits());
+        let Ok((device, queue)) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    required_limits,
+                    ..Default::default()
+                },
+                None,
+            )
+            .block_on()
+        else {
+            return;
+        };
+
+        let device = Arc::new(device);
+        let (texture_layout, storage_layout, camera_layout) = crate::create_bind_group_layouts(&device);
+        let texture_layout = Arc::new(texture_layout);
+        let storage_layout = Arc::new(storage_layout);
+        let camera_layout = Arc::new(camera_layout);
+        let camera_entry_size =
+            std::num::NonZeroU64::new(std::mem::size_of::<CameraTransform>() as u64);
+
+        let mut atlas_pool = AtlasPool::new(&device, &texture_layout, (256, 256), 4, true);
+        let mut dynamic_storage =
+            DynamicBuffer::new(&device, storage_layout, 64, wgpu::BufferUsages::STORAGE);
+        let mut camera_dynamic_uniform = DynamicBuffer::new_with_binding_size(
+            &device,
+            camera_layout,
+            64,
+            wgpu::BufferUsages::STORAGE,
+            camera_entry_size,
+        );
+        let mut line_buffers = line::LineBuffers::new(&device);
+
+        let mut game = bones::Game::new();
+        let assets = game.init_shared_resource::<bones::AssetServer>();
+        let img_handle = bones::UntypedHandle { rid: bones::Ulid(1) }.typed();
+        let img_cid = bones::Cid([1; 32]);
+        let rgba = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255]));
+        assets.store.asset_ids.insert(img_handle.untyped(), img_cid);
+        assets.store.assets.insert(
+            img_cid,
+            bones::LoadedAsset {
+                cid: img_cid,
+                pack_spec: None,
+                loc: bones::AssetLoc {
+                    path: std::path::PathBuf::from("/test.png"),
+                    pack: None,
+                },
+                dependencies: Vec::new(),
+                data: bones::SchemaBox::new(bones::Image::Data(image::DynamicImage::ImageRgba8(
+                    rgba,
+                ))),
+            },
+        );
+        drop(assets);
+
+        let shader_a = bones::UntypedHandle {
+            rid: bones::Ulid(10),
+        }
+        .typed();
+        let shader_b = bones::UntypedHandle {
+            rid: bones::Ulid(20),
+        }
+        .typed();
+
+        game.sessions
+            .create_with("world", |s: &mut bones::Session| {
+                let mut entities = s.world.resource_mut::<bones::Entities>();
+                let cam_ent = entities.create();
+                let s1 = entities.create();
+                let s2 = entities.create();
+                let s3 = entities.create();
+                let s4 = entities.create();
+                drop(entities);
+
+                let mut transforms = s.world.component_mut::<bones::Transform>();
+                transforms.insert(cam_ent, bones::Transform::default());
+                transforms.insert(s1, bones::Transform::default());
+                transforms.insert(s2, bones::Transform::default());
+                transforms.insert(s3, bones::Transform::default());
+                transforms.insert(s4, bones::Transform::default());
+
+                s.world
+                    .component_mut::<bones::Camera>()
+                    .insert(cam_ent, bones::Camera::default());
+
+                let mut sprites = s.world.component_mut::<bones::Sprite>();
+                for ent in [s1, s2, s3, s4] {
+                    sprites.insert(
+                        ent,
+                        bones::Sprite {
+                            image: img_handle,
+                            color: bones::Color::WHITE,
+                            ..Default::default()
+                        },
+                    );
+                }
+
+                let mut materials = s.world.component_mut::<bones::SpriteMaterial>();
+                materials.insert(
+                    s1,
+                    bones::SpriteMaterial {
+                        shader: shader_a,
+                        params0: Vec4::new(1.0, 2.0, 3.0, 4.0),
+                        params1: Vec4::new(5.0, 6.0, 7.0, 8.0),
+                    },
+                );
+                materials.insert(
+                    s2,
+                    bones::SpriteMaterial {
+                        shader: shader_b,
+                        params0: Vec4::splat(9.0),
+                        params1: Vec4::splat(10.0),
+                    },
+                );
+                materials.insert(
+                    s3,
+                    bones::SpriteMaterial {
+                        shader: shader_a,
+                        params0: Vec4::splat(11.0),
+                        params1: Vec4::splat(12.0),
+                    },
+                );
+                // s4 has no SpriteMaterial -> shader: None
+            });
+
+        update_atlas_pool(&game, &mut atlas_pool, &queue);
+        let prepared = prepare_render_frame(
+            &game,
+            &atlas_pool,
+            &device,
+            &queue,
+            &mut camera_dynamic_uniform,
+            &mut dynamic_storage,
+            &mut line_buffers,
+            UVec2::new(800, 600),
+            1.0,
+            bones::Color::BLACK,
+            1.5,
+        );
+
+        assert_eq!(prepared.len(), 1);
+        let batches: Vec<(Option<bones::Handle<bones::Shader>>, Range<u32>)> = prepared[0]
+            .draws
+            .iter()
+            .filter_map(|cmd| match cmd {
+                SessionDrawCmd::SpriteBatch {
+                    shader, instances, ..
+                } => Some((*shader, instances.clone())),
+                SessionDrawCmd::Line(_) => None,
+            })
+            .collect();
+
+        // s4 (None) -> 1 instance; s1 & s3 (shader_a) -> batched into 2 instances; s2 (shader_b) -> 1 instance.
+        assert_eq!(
+            batches,
+            vec![(None, 0..1), (Some(shader_a), 1..3), (Some(shader_b), 3..4),]
+        );
+
+        let mat = bones::SpriteMaterial {
+            shader: shader_a,
+            params0: Vec4::new(1.0, 2.0, 3.0, 4.0),
+            params1: Vec4::new(5.0, 6.0, 7.0, 8.0),
+        };
+        let with_mat = AtlasSpriteUniform::default().with_material(Some(&mat));
+        assert_eq!(with_mat.shader_params0, [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(with_mat.shader_params1, [5.0, 6.0, 7.0, 8.0]);
+        let without_mat = AtlasSpriteUniform::default().with_material(None);
+        assert_eq!(without_mat.shader_params0, [0.0; 4]);
+        assert_eq!(without_mat.shader_params1, [0.0; 4]);
     }
 }

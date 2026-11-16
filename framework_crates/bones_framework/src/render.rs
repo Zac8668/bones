@@ -4,7 +4,7 @@ use bones_lib::prelude::*;
 
 /// Module prelude.
 pub mod prelude {
-    pub use super::{camera::*, color::*, line::*, sprite::*, tilemap::*, transform::*};
+    pub use super::{camera::*, color::*, line::*, shader::*, sprite::*, tilemap::*, transform::*};
 
     #[cfg(feature = "audio")]
     pub use super::super::audio::*;
@@ -16,6 +16,7 @@ pub mod prelude {
 pub mod camera;
 pub mod color;
 pub mod line;
+pub mod shader;
 pub mod sprite;
 pub mod tilemap;
 pub mod transform;
@@ -25,6 +26,8 @@ pub mod ui;
 
 /// Bones framework rendering plugin.
 pub fn render_plugin(session: &mut Session) {
+    shader::Shader::register_schema();
+    shader::SpriteMaterial::register_schema();
     session
         .install_plugin(sprite::sprite_plugin)
         .install_plugin(camera::plugin);

@@ -19,6 +19,7 @@ profiling         = "1.0.16"
 pollster          = "0.4.0"
 env_logger        = "0.11.6"
 log               = "0.4"
+tracing           = { workspace = true }
 bevy_tasks        = "0.11.3"
 image             = "0.24.9"
 bytemuck          = "1.22"

@@ -31,6 +31,12 @@ pub trait AssetIo: Sync + Send {
         let _ = change_sender;
         false
     }
+
+    /// Resolve an asset location to its filesystem path, if backed by local files.
+    fn resolve_path(&self, loc: AssetLocRef) -> Option<PathBuf> {
+        let _ = loc;
+        None
+    }
 }
 
 /// [`AssetIo`] implementation that loads from the filesystem.
@@ -98,21 +104,24 @@ impl AssetIo for FileAssetIo {
         })
     }
 
+    fn resolve_path(&self, loc: AssetLocRef) -> Option<PathBuf> {
+        let base_dir = match loc.pack {
+            Some(folder) => self.packs_dir.join(folder),
+            None => self.core_dir.clone(),
+        };
+        // Make sure absolute paths are relative to pack.
+        let path = loc.path.absolutize_from("/").ok()?;
+        let path = path.strip_prefix("/").ok()?;
+        Some(base_dir.join(path))
+    }
+
     fn load_file(&self, loc: AssetLocRef) -> BoxedFuture<anyhow::Result<Vec<u8>>> {
-        let packs_dir = self.packs_dir.clone();
-        let core_dir = self.core_dir.clone();
-        let loc = loc.to_owned();
+        let path = self.resolve_path(loc);
+        let loc_path = loc.path.to_owned();
 
         // TODO: Load files asynchronously.
         Box::pin(async move {
-            let base_dir = match loc.pack {
-                Some(folder) => packs_dir.join(folder),
-                None => core_dir.clone(),
-            };
-            // Make sure absolute paths are relative to pack.
-            let path = loc.path.absolutize_from("/").unwrap();
-            let path = path.strip_prefix("/").unwrap();
-            let path = base_dir.join(path);
+            let path = path.with_context(|| format!("Could not resolve file: {loc_path:?}"))?;
             std::fs::read(&path).with_context(|| format!("Could not load file: {path:?}"))
         })
     }
